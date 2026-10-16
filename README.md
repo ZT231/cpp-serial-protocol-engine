@@ -232,7 +232,7 @@ build\test_frame.exe
 **① 用了什么语法**
 `using Handler = std::function<Frame(const Frame&)>` **通用可调用对象**（函数指针 / lambda 都能装）、`std::unordered_map<string, Handler>` 查表、
 **普通自由函数 + lambda** 做 handler（PING 用 lambda、复杂命令用命名函数）、`bool dispatch(req, out)` 用返回值表达"是否找到命令"、
-`emplace(...).second` 判断是否插入成功、`std::to_string`、`inline` 头文件函数。
+`handlers_.count(command)` 判重 + `handlers_[command] = handler` 写入、`std::to_string`、`inline` 头文件函数。
 
 **② 为什么这么设计**
 - **为什么用 `std::function` 而不是裸函数指针**：`std::function` 是「通用可调用对象包装器」，函数指针、lambda、仿函数都能装。
@@ -249,14 +249,14 @@ build\test_frame.exe
 - 用 if-else 链 → 加命令要改分派函数，分支越多越容易漏 `else`，且时间复杂度随命令数线性增长。
 - 用裸函数指针 → 接不了「捕获了外部变量的 lambda」，以后想做"记住状态"的命令（比如记住上次位置）就没法就地写；
   `std::function` 统一了函数指针和 lambda，扩展性更好（代价是类型擦除、一点点额外开销，控制链路可忽略）。
-- `emplace` 不检查 `.second` → 同名命令被悄悄覆盖，旧逻辑被替换还不知道（`registerCommand` 返回 false 就是要拦住这个）。
+- 注册时不判重、直接 `handlers_[command] = handler` → 同名命令被悄悄覆盖，旧逻辑被替换还不知道（`registerCommand` 先用 `count()` 拦住这个）。
 - `registerCommand` 不判 handler 是否为 `nullptr` → 调用时空指针函数直接崩。所以注册前必须检查。
 - 命令层和解析层混在一起 → 加一条命令要同时改解析器，改一处协议会牵连所有命令。
 
 ## 6. `ISerialPort` — `iserial_port.hpp`
 
 **① 用了什么语法**
-纯虚函数接口（`= 0`）、`virtual ~ISerialPort() = default` 虚析构、`struct SerialConfig` 默认成员初始化、
+纯虚函数接口（`= 0`）、`virtual ~ISerialPort() {}` 虚析构、`struct SerialConfig` 默认成员初始化、
 `std::uint8_t*` 裸指针作为读写缓冲、`const` 成员函数（`isOpen`）、注释里写清返回约定（>0 有数据 / 0 无数据 / 负数出错）。
 
 **② 为什么这么设计**
@@ -346,7 +346,7 @@ Meyers 单例（函数内 `static Logger inst`）、`enum class LogLevel`、`= d
 - **用 `steady_clock` 而不是 `system_clock`**：`steady_clock` 单调递增、不受系统改时间影响，算超时必须用它
   （`system_clock` 会被 NTP/手动改时间打断，超时计算就乱了）。
 - **写失败/读错误返回 `false`（应答写在 `out` 出参），超时也返回 `false`**：把"没有应答"统一成一个 `bool`，调用方一个 `if (!ok)` 就兜住。
-- **只取第一帧应答**：设备可能连发（粘包），`frames.front()` 取最早一帧，后续帧留给下轮（或阶段 4 的异步队列）。
+- **只取第一帧应答**：设备可能连发（粘包），`frames[0]` 取最早一帧，后续帧留给下轮（或阶段 4 的异步队列）。
 
 **③ 不这么写会出什么问题**
 - 用 `system_clock` 算超时 → 系统一校时，超时判断要么提前要么拖后，行为不可复现。
@@ -357,22 +357,22 @@ Meyers 单例（函数内 `static Logger inst`）、`enum class LogLevel`、`= d
 ## 11. `BlockingQueue<T>` — `blocking_queue.hpp`
 
 **① 用了什么语法**
-`std::mutex` + `std::lock_guard` / `std::unique_lock`、`std::condition_variable` 的 `wait_for`（带谓词）、
+`std::mutex` + `std::lock_guard` / `std::unique_lock`、`std::condition_variable` 的 `wait_for`（不带谓词，配 `while` 循环重查条件）、
 `std::deque` 做底层队列、`push(T value)` **按值传参 + `std::move` 搬进队列**（没人再用的副本直接搬，不拷贝）、
 `tryPop` 用 `std::move` 把队头搬出来构造 `std::optional<T>` 返回、类模板、`mutable std::mutex`（供 const 成员函数加锁）。
 
 **② 为什么这么设计**
 - **用条件变量而不是忙等**：没数据时消费者 `wait_for` 睡着，生产者 `push` 时 `notify_one` 唤醒——空转 0 CPU，
   这是"线程协作"最基础的积木，也是生产者-消费者模型的教科书实现。
-- **`wait_for` 带谓词**：醒来后再查一次 `!queue_.empty() || closed_`，防"伪唤醒"（spurious wakeup）——
-  系统可能无缘无故唤醒线程，不带谓词就可能在空队列上继续取。
+- **`while` 循环重查条件**：不带谓词的 `wait_for` 醒来后，回到 `while` 顶部再查一次 `!queue_.empty() || closed_`，防"伪唤醒"（spurious wakeup）——
+  系统可能无缘无故唤醒线程，醒来后不重查条件就可能在空队列上继续取。这也是标准写法：带谓词的 `cv.wait(lock, 谓词)` 等价，本项目选了循环版。
 - **`close()` 唤醒所有等待者**：接收线程退出时用它通知主线程"不会再有数据了"，让卡在 `tryPop` 的消费者立即返回，
   而不是傻等满整个超时——这是优雅停机的关键一步。
 - **`push` 用 `notify_one`、`close` 用 `notify_all`**：入队只需要唤醒一个消费者抢；关闭要唤醒全部（大家都要退出）。
 
 **③ 不这么写会出什么问题**
 - 用忙等轮询标志位 → 空转吃满一个 CPU 核，还可能在多核上出现缓存一致性的可见性问题。
-- 不带谓词的 `wait` → 伪唤醒后拿空数据、或漏掉"已关闭"这个状态，逻辑错乱（这是并发里最经典的坑）。
+- `wait_for` 醒来后不重查条件就直接取数据 → 伪唤醒后拿空数据、或漏掉"已关闭"这个状态，逻辑错乱（这是并发里最经典的坑）。
 - 只在 `push` 里 `notify_one`、忘了在 `close` 里 `notify_all` → 消费者可能永远等在那儿，程序退不出去。
 - 返回容器内部引用（`const T& front()`）而不是拷贝 → 锁一释放，别的线程改数据，引用就悬了。
 
@@ -479,10 +479,10 @@ A：因为它们是**两个角色**。`SerialSession` 是客户端——发命�
 A：`steady_clock` 是单调递增的，只往前不会回退；`system_clock` 是墙上时钟，会被 NTP 校时、手动改时间打断。
 算"过了多少毫秒"必须用单调时钟，否则校时一下，超时可能瞬间"归零"或"暴涨"，行为不可复现。
 
-**Q：`wait_for` 为什么要带谓词（伪唤醒是什么）？**
-A：条件变量可能被**无缘无故唤醒**（spurious wakeup），即使没人 `notify`。所以标准写法是
-`cv.wait(lock, 谓词)`，醒来后**重新检查一次条件**，不满足就继续睡。不带谓词、只写 `wait` 然后直接取数据，
-就会在空队列上取到脏值——这是并发编程最经典的坑，也是为什么标准库提供了带谓词的重载。
+**Q：`wait_for` 醒来后为什么要重查条件（伪唤醒是什么）？**
+A：条件变量可能被**无缘无故唤醒**（spurious wakeup），即使没人 `notify`。所以醒来后必须**重新检查一次条件**，不满足就继续睡。
+本项目用的是「不带谓词的 `wait_for` + `while` 循环重查」；标准库的带谓词重载 `cv.wait(lock, 谓词)` 是等价写法，两者二选一。
+醒来后不重查条件、直接取数据，就会在空队列上取到脏值——这是并发编程最经典的坑。
 
 **Q：跨线程共享的停止标志，为什么用 `std::atomic<bool>` 而不是普通 `bool`？**
 A：主线程写、工作线程读同一个 `bool`，不加同步就是**数据竞争**（C++ 标准定义的未定义行为），
